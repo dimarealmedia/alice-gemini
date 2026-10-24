@@ -159,3 +159,22 @@ test("question flows through search and Gemini with date in the prompt", async (
   assert.equal(payload.response.text, "Сейчас плюс 24.");
   assert.equal(payload.session_state.history.length, 2);
 });
+
+test("a Gemini timeout gives the retry message, not a generic failure", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "test-gemini";
+  globalThis.fetch = async () => {
+    throw new DOMException("This operation was aborted", "AbortError");
+  };
+
+  let payload;
+  const res = { status() { return this; }, json(value) { payload = value; return value; }, setHeader() {} };
+  try {
+    await handler({ method: "POST", body: { request: { command: "Расскажи сказку" }, state: { session: {} } } }, res);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.GEMINI_API_KEY;
+  }
+  assert.match(payload.response.text, /Не успела подготовить ответ/);
+});

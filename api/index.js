@@ -2,9 +2,12 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+// Yandex waits 4.5 s; the rest covers the network between Yandex and Vercel.
+const TOTAL_RESPONSE_BUDGET_MS = 4000;
+// Serper usually answers in 0.6–1.5 s, so 600 ms dropped most searches.
+const SERPER_TIMEOUT_MS = 1300;
+const GEMINI_TIMEOUT_MS = 3000;
+const GEMINI_MIN_BUDGET_MS = 2500;
 
 const DEFAULT_TIMEZONE = "Europe/Moscow";
 const MAX_OUTPUT_TOKENS = 400;
@@ -204,7 +207,7 @@ async function searchWeb(query, timeoutMs) {
     }
     return formatSearchResults(data);
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
+    console.warn(`Serper request did not finish within ${Math.min(SERPER_TIMEOUT_MS, timeoutMs)} ms; continuing without search.`);
     return "";
   }
 }
@@ -324,20 +327,27 @@ export default async function handler(req, res) {
 
   try {
     let searchContext = "";
+    let searchMs = 0;
     if (needsSearch(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
+      // Search must leave Gemini enough time, because Alice expects a response within 4.5 seconds.
+      const searchStartedAt = Date.now();
       searchContext = await searchWeb(
         buildSearchQuery(text, oldHistory, homeCity),
-        Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600))
+        Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - GEMINI_MIN_BUDGET_MS))
       );
+      searchMs = Date.now() - searchStartedAt;
     }
 
+    const geminiStartedAt = Date.now();
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600)),
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 200)),
       systemPrompt
+    );
+    console.info(
+      `Answered in ${Date.now() - startedAt} ms: search ${searchContext ? "ok" : "none"} ${searchMs} ms, Gemini ${Date.now() - geminiStartedAt} ms`
     );
 
     const history = [
@@ -348,8 +358,13 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
+    // fetch() aborts with name "AbortError" and a message like "This operation was aborted".
+    const timedOut = error?.name === "AbortError" || error?.name === "TimeoutError";
+    const safeError = timedOut ? new Error("TIME_BUDGET_EXHAUSTED") : error;
+    console.warn(
+      `Alice webhook returned a fallback response after ${Date.now() - startedAt} ms:`,
+      safeError?.message || "unknown error"
+    );
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
