@@ -6,13 +6,22 @@ const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
 const GEMINI_TIMEOUT_MS = 2500;
 
+const DEFAULT_TIMEZONE = "Europe/Moscow";
+const MAX_OUTPUT_TOKENS = 400;
+
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-  "Если не знаешь ответа, честно скажи об этом."
+  "Начинай сразу с сути ответа: сначала прямой ответ, потом при необходимости одно уточнение.",
+  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами, ссылки, адреса сайтов, эмодзи или длинные вступления.",
+  "Короткие реплики вроде «а завтра?» или «а он сколько стоит?» понимай в контексте предыдущих реплик.",
+  "Если переданы результаты поиска, для фактов о текущем положении дел (цены, курсы, погода, новости, счёт матчей, кто сейчас занимает должность) доверяй им больше, чем своим знаниям. Не выдумывай отсутствующие факты.",
+  "Если результаты поиска не отвечают на вопрос, а сам ты точно не знаешь, честно скажи об этом одной фразой."
 ].join(" ");
+
+// JS \b does not see Cyrillic word boundaries, so whole-word checks use lookarounds.
+const OFFLINE_INTENT = /^(привет|здравствуй|добр(ое|ый)|спасибо|благодарю|пока|до свидания|как дела|как ты|кто ты|как тебя зовут|что ты умеешь|понятно|ясно)(?=$|[\s,.!?])|сказк|стих|шутк|пошути|анекдот|загадк|придумай|сочини|напиши|перевед|переведи|посчитай|сколько будет \d|скороговорк|поговорим|давай поиграем|игр(а|у) в/i;
+const WEATHER_INTENT = /погод|температур|градус|дожд|снег|осадк|ветер|прогноз/i;
 
 function aliceResponse(text, endSession = false, history = []) {
   return {
@@ -49,6 +58,67 @@ function isSearchIntent(text) {
   return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
 }
 
+// Search by default: almost any factual question benefits from fresh data.
+// Only small talk, creative tasks and arithmetic go straight to Gemini.
+function needsSearch(text) {
+  return isSearchIntent(text) || !OFFLINE_INTENT.test(text.trim());
+}
+
+// Follow-ups like "а завтра?" carry no topic on their own, so the search query
+// borrows the previous user question. A home city fills in weather questions.
+function buildSearchQuery(text, history, homeCity = "") {
+  let query = text.trim();
+  const words = query.split(/\s+/).filter(Boolean);
+  const lastUser = [...history].reverse().find(item => item.role === "user")?.text;
+  if (lastUser && words.length <= 4) query = `${lastUser} ${query}`;
+
+  const city = homeCity.trim();
+  if (city && WEATHER_INTENT.test(query) && !/(^|\s)(в|во)\s+[А-ЯЁA-Z]/.test(query)) {
+    query = `${query} ${city}`;
+  }
+  return query.slice(0, 300);
+}
+
+function currentDateLine(timezone) {
+  const format = zone => new Intl.DateTimeFormat("ru-RU", {
+    timeZone: zone,
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(new Date());
+
+  let zone = typeof timezone === "string" && timezone ? timezone : DEFAULT_TIMEZONE;
+  let formatted;
+  try {
+    formatted = format(zone);
+  } catch {
+    zone = DEFAULT_TIMEZONE;
+    formatted = format(zone);
+  }
+  return `Сейчас ${formatted} (часовой пояс пользователя ${zone}).`;
+}
+
+function buildSystemPrompt({ timezone, homeCity } = {}) {
+  const parts = [SYSTEM_PROMPT, currentDateLine(timezone)];
+  const city = String(homeCity || "").trim();
+  if (city) parts.push(`Пользователь живёт в городе ${city}; если в вопросе о погоде, времени или местах город не назван, имей в виду этот город.`);
+  return parts.join(" ");
+}
+
+// The model occasionally slips into Markdown or reads out links; neither works by voice.
+function cleanForVoice(value) {
+  return String(value ?? "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[*_#`>]+/g, "")
+    .replace(/^\s*[-•]\s+/gm, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 function safeHistory(history) {
   if (!Array.isArray(history)) return [];
   return history
@@ -69,6 +139,42 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
+// Links are left out on purpose: the model would read them aloud.
+function formatSearchResults(data) {
+  const clip = (value, max) => String(value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+  const lines = [];
+
+  const box = data?.answerBox;
+  if (box) {
+    const boxText = [box.title, box.answer, box.snippet].filter(Boolean).map(v => clip(v, 300)).join(" — ");
+    if (boxText) lines.push(`Прямой ответ поисковика: ${boxText}`);
+  }
+
+  const graph = data?.knowledgeGraph;
+  if (graph?.title) {
+    const attributes = Object.entries(graph.attributes || {})
+      .slice(0, 6)
+      .map(([key, value]) => `${clip(key, 60)}: ${clip(value, 120)}`)
+      .join("; ");
+    const description = [graph.type, graph.description].filter(Boolean).map(v => clip(v, 300)).join(". ");
+    lines.push(`Справка: ${clip(graph.title, 120)}. ${description}${attributes ? ` (${attributes})` : ""}`.trim());
+  }
+
+  const organic = Array.isArray(data?.organic) ? data.organic.slice(0, 5) : [];
+  organic.forEach((item, i) => {
+    const date = item.date ? ` [${clip(item.date, 40)}]` : "";
+    lines.push(`${i + 1}. ${clip(item.title, 160)}${date}: ${clip(item.snippet, 320)}`);
+  });
+
+  const stories = Array.isArray(data?.topStories) ? data.topStories.slice(0, 3) : [];
+  stories.forEach(item => {
+    const date = item.date ? ` [${clip(item.date, 40)}]` : "";
+    lines.push(`Новость${date}: ${clip(item.title, 200)}`);
+  });
+
+  return lines.join("\n");
+}
+
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
   if (!key || timeoutMs < 150) return "";
@@ -82,7 +188,12 @@ async function searchWeb(query, timeoutMs) {
           "X-API-KEY": key,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
+        body: JSON.stringify({
+          q: query,
+          gl: String(process.env.SEARCH_COUNTRY || "ru").trim().toLowerCase(),
+          hl: "ru",
+          num: 5
+        })
       },
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
@@ -91,26 +202,14 @@ async function searchWeb(query, timeoutMs) {
       console.warn("Serper request failed with HTTP", response.status);
       return "";
     }
-
-    const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
-
-    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
-    return items.length ? items.join("\n") : "";
+    return formatSearchResults(data);
   } catch (error) {
     console.warn("Serper request did not finish in time; continuing without search.");
     return "";
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
+async function askGemini(text, history, searchContext, timeoutMs, systemPrompt = SYSTEM_PROMPT) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
@@ -137,11 +236,13 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         "x-goog-api-key": key
       },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        systemInstruction: { parts: [{ text: systemPrompt }] },
         contents,
         generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
+          // Lower temperature keeps factual answers close to the search results.
+          temperature: 0.3,
+          // Thinking tokens count toward this limit, so it leaves room beyond the spoken answer.
+          maxOutputTokens: MAX_OUTPUT_TOKENS
         }
       })
     },
@@ -157,10 +258,10 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }
 
   const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
+  const answer = cleanForVoice((candidate?.content?.parts || [])
+    .filter(part => !part.thought)
     .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
+    .join(""));
 
   if (!answer) {
     if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
@@ -218,18 +319,25 @@ export default async function handler(req, res) {
     ));
   }
 
+  const homeCity = String(process.env.HOME_CITY || "");
+  const systemPrompt = buildSystemPrompt({ timezone: body?.meta?.timezone, homeCity });
+
   try {
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+    if (needsSearch(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      searchContext = await searchWeb(
+        buildSearchQuery(text, oldHistory, homeCity),
+        Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600))
+      );
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600)),
+      systemPrompt
     );
 
     const history = [
@@ -246,4 +354,14 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export {
+  aliceResponse,
+  buildSearchQuery,
+  buildSystemPrompt,
+  cleanForVoice,
+  fitAliceText,
+  formatSearchResults,
+  isSearchIntent,
+  needsSearch,
+  safeHistory
+};
