@@ -4,10 +4,10 @@ const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 // Yandex waits 4.5 s; the rest covers the network between Yandex and Vercel.
 const TOTAL_RESPONSE_BUDGET_MS = 4000;
-// Serper usually answers in 0.6–1.5 s, so 600 ms dropped most searches.
-const SERPER_TIMEOUT_MS = 1300;
+// Measured on Vercel fra1: Serper 0.7–1.4 s, Gemini 0.6–0.9 s. 600 ms dropped every search.
+const SERPER_TIMEOUT_MS = 1800;
 const GEMINI_TIMEOUT_MS = 3000;
-const GEMINI_MIN_BUDGET_MS = 2500;
+const GEMINI_MIN_BUDGET_MS = 2000;
 
 const DEFAULT_TIMEZONE = "Europe/Moscow";
 const MAX_OUTPUT_TOKENS = 400;
@@ -19,7 +19,8 @@ const SYSTEM_PROMPT = [
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами, ссылки, адреса сайтов, эмодзи или длинные вступления.",
   "Короткие реплики вроде «а завтра?» или «а он сколько стоит?» понимай в контексте предыдущих реплик.",
   "Если переданы результаты поиска, для фактов о текущем положении дел (цены, курсы, погода, новости, счёт матчей, кто сейчас занимает должность) доверяй им больше, чем своим знаниям. Не выдумывай отсутствующие факты.",
-  "Если результаты поиска не отвечают на вопрос, а сам ты точно не знаешь, честно скажи об этом одной фразой."
+  "Если результаты поиска не отвечают на вопрос, а сам ты точно не знаешь, честно скажи об этом одной фразой.",
+  "Не заканчивай ответ встречным вопросом или предложением рассказать ещё: пользователь сам спросит, если захочет."
 ].join(" ");
 
 // JS \b does not see Cyrillic word boundaries, so whole-word checks use lookarounds.
@@ -212,7 +213,7 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs, systemPrompt = SYSTEM_PROMPT) {
+async function askGemini(text, history, searchContext, timeoutMs, systemPrompt = SYSTEM_PROMPT, liveDataUnavailable = false) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
@@ -225,9 +226,13 @@ async function askGemini(text, history, searchContext, timeoutMs, systemPrompt =
     parts: [{ text: item.text }]
   }));
 
-  const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
-    : text;
+  let prompt = text;
+  if (searchContext) {
+    prompt = `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`;
+  } else if (liveDataUnavailable) {
+    // Without search the model would otherwise invent today's weather or rates.
+    prompt = `${text}\n\nПоиск в интернете сейчас не ответил. Не называй текущие цифры (погоду, курсы, цены, счёт, новости): скажи одной фразой, что не удалось проверить свежие данные, и предложи спросить ещё раз.`;
+  }
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
   const { response, data } = await fetchJson(
@@ -344,7 +349,8 @@ export default async function handler(req, res) {
       oldHistory,
       searchContext,
       Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 200)),
-      systemPrompt
+      systemPrompt,
+      !searchContext && isSearchIntent(text) && Boolean(process.env.SERPER_API_KEY)
     );
     console.info(
       `Answered in ${Date.now() - startedAt} ms: search ${searchContext ? "ok" : "none"} ${searchMs} ms, Gemini ${Date.now() - geminiStartedAt} ms`

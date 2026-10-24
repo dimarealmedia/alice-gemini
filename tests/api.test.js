@@ -178,3 +178,26 @@ test("a Gemini timeout gives the retry message, not a generic failure", async ()
   }
   assert.match(payload.response.text, /Не успела подготовить ответ/);
 });
+
+test("when search fails on a live-data question, Gemini is told not to guess numbers", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  const bodies = [];
+  process.env.GEMINI_API_KEY = "test-gemini";
+  process.env.SERPER_API_KEY = "test-serper";
+  globalThis.fetch = async (url, options) => {
+    bodies.push(JSON.parse(options.body));
+    if (String(url).includes("serper")) return { ok: false, status: 500, json: async () => ({}) };
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: "Не удалось проверить." }] } }] }) };
+  };
+
+  const res = { status() { return this; }, json(value) { return value; }, setHeader() {} };
+  try {
+    await handler({ method: "POST", body: { request: { command: "какая погода сегодня" }, state: { session: {} } } }, res);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.SERPER_API_KEY;
+  }
+  assert.match(bodies.at(-1).contents.at(-1).parts[0].text, /Поиск в интернете сейчас не ответил/);
+});
